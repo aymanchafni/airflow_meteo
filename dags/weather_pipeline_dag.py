@@ -1,243 +1,87 @@
 """
-DAG: weather_pipeline
-TP2 - INF8200 Hiver 2026
+Daily multi-city weather pipeline (Open-Meteo -> DuckDB).
 
-Pipeline de données météo multi-villes basé sur l'API Open-Meteo (gratuite, sans clé).
+    fetch[montreal] ─┐
+    fetch[toronto]  ─┤
+    fetch[...]      ─┼─► transform_validate ─► load (upsert) ─► report
+    fetch[paris]    ─┘
 
-Graphe de dépendances :
-    fetch_montreal ──┐
-                     ├──► merge_cities ──► transform ──► save_results
-    fetch_paris ─────┘
+* One run per day (`ds`); every task only touches that day's data, so runs are
+  idempotent and the DAG can be backfilled: `airflow dags backfill weather_pipeline -s ... -e ...`
+* `fetch` is dynamically mapped over the cities in `weather/config.py`.
+* Bad data fails the run in `transform_validate` before anything is loaded.
 """
 
-import json
-import os
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
-import requests
-import pandas as pd
-
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-OUTPUT_DIR = "/opt/airflow/data"  # répertoire monté via volume Docker
-
-CITIES = {
-    "montreal": {"latitude": 45.5088, "longitude": -73.5878},
-    "paris":    {"latitude": 48.8566, "longitude":   2.3522},
-}
-
-API_BASE = "https://api.open-meteo.com/v1/forecast"
-API_PARAMS = {
-    "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum",
-    "timezone": "auto",
-    "past_days": 7,
-}
-
-# ---------------------------------------------------------------------------
-# Fonctions des tâches
-# ---------------------------------------------------------------------------
-
-def fetch_city(city_name: str, latitude: float, longitude: float) -> None:
-    """
-    Télécharge les données météo des 7 derniers jours pour une ville donnée
-    via l'API Open-Meteo et sauvegarde le résultat brut en JSON.
-    """
-    params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        **API_PARAMS,
-    }
-
-    response = requests.get(API_BASE, params=params, timeout=30)
-    response.raise_for_status()
-    data = response.json()
-
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out_path = os.path.join(OUTPUT_DIR, f"{city_name}_raw.json")
-
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-    print(f"[{city_name}] Données sauvegardées dans {out_path}")
-    print(f"[{city_name}] Jours reçus : {data['daily']['time']}")
+from airflow.decorators import dag, task
 
 
-def fetch_montreal() -> None:
-    fetch_city("montreal", **CITIES["montreal"])
-
-
-def fetch_paris() -> None:
-    fetch_city("paris", **CITIES["paris"])
-
-
-def merge_cities() -> None:
-    """
-    Fusionne les fichiers JSON bruts des deux villes en un seul DataFrame
-    et le sauvegarde en CSV intermédiaire.
-
-    Cette tâche dépend de fetch_montreal ET fetch_paris.
-    Elle ne peut s'exécuter qu'une fois les deux extractions terminées.
-    """
-    dfs = []
-
-    for city_name in CITIES:
-        raw_path = os.path.join(OUTPUT_DIR, f"{city_name}_raw.json")
-
-        if not os.path.exists(raw_path):
-            raise FileNotFoundError(
-                f"Fichier manquant pour {city_name} : {raw_path}. "
-                "Vérifiez que les tâches fetch ont bien été exécutées."
-            )
-
-        with open(raw_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        daily = data["daily"]
-        df = pd.DataFrame({
-            "date":            daily["time"],
-            "temp_max":        daily["temperature_2m_max"],
-            "temp_min":        daily["temperature_2m_min"],
-            "precipitation":   daily["precipitation_sum"],
-            "city":            city_name,
-        })
-        dfs.append(df)
-
-    merged = pd.concat(dfs, ignore_index=True)
-    merged["date"] = pd.to_datetime(merged["date"])
-
-    merged_path = os.path.join(OUTPUT_DIR, "merged.csv")
-    merged.to_csv(merged_path, index=False)
-
-    print(f"Fusion terminée : {len(merged)} lignes → {merged_path}")
-    print(merged.to_string(index=False))
-
-
-def transform() -> None:
-    """
-    Calcule des statistiques par ville à partir du CSV fusionné :
-      - Température maximale moyenne sur la période
-      - Température minimale moyenne sur la période
-      - Jour le plus pluvieux
-      - Total des précipitations
-    """
-    merged_path = os.path.join(OUTPUT_DIR, "merged.csv")
-
-    if not os.path.exists(merged_path):
-        raise FileNotFoundError(f"Fichier fusionné introuvable : {merged_path}")
-
-    df = pd.read_csv(merged_path, parse_dates=["date"])
-
-    stats_rows = []
-
-    for city, group in df.groupby("city"):
-        rainiest_idx = group["precipitation"].idxmax()
-        rainiest_day = group.loc[rainiest_idx, "date"].strftime("%Y-%m-%d")
-
-        stats_rows.append({
-            "city":                city,
-            "avg_temp_max":        round(group["temp_max"].mean(), 2),
-            "avg_temp_min":        round(group["temp_min"].mean(), 2),
-            "total_precipitation": round(group["precipitation"].sum(), 2),
-            "rainiest_day":        rainiest_day,
-        })
-
-    stats = pd.DataFrame(stats_rows)
-
-    stats_path = os.path.join(OUTPUT_DIR, "stats.csv")
-    stats.to_csv(stats_path, index=False)
-
-    print("Statistiques calculées :")
-    print(stats.to_string(index=False))
-
-
-def save_results() -> None:
-    """
-    Vérifie la présence des fichiers de sortie et affiche un résumé final
-    dans les logs Airflow. Dans un contexte de production, cette tâche
-    pourrait envoyer les résultats vers un entrepôt de données ou un dashboard.
-    """
-    expected_files = [
-        "montreal_raw.json",
-        "paris_raw.json",
-        "merged.csv",
-        "stats.csv",
-    ]
-
-    print("=== Vérification des fichiers produits ===")
-    all_ok = True
-
-    for filename in expected_files:
-        path = os.path.join(OUTPUT_DIR, filename)
-        if os.path.exists(path):
-            size = os.path.getsize(path)
-            print(f"  ✓ {filename}  ({size} octets)")
-        else:
-            print(f"  ✗ {filename}  MANQUANT")
-            all_ok = False
-
-    if not all_ok:
-        raise RuntimeError("Certains fichiers de sortie sont manquants. Consultez les logs.")
-
-    # Affichage du rapport final
-    stats_path = os.path.join(OUTPUT_DIR, "stats.csv")
-    stats = pd.read_csv(stats_path)
-    print("\n=== Rapport final ===")
-    print(stats.to_string(index=False))
-    print("\nPipeline complété avec succès.")
-
-
-# ---------------------------------------------------------------------------
-# Définition du DAG
-# ---------------------------------------------------------------------------
-
-default_args = {
-    "owner": "tp2_inf8200",
-    "retries": 1,
-    "retry_delay": timedelta(minutes=2),
-}
-
-with DAG(
+@dag(
     dag_id="weather_pipeline",
-    description="Pipeline météo multi-villes : Open-Meteo → merge → stats → CSV",
-    default_args=default_args,
-    start_date=datetime(2026, 1, 1),
-    schedule_interval=None,   # déclenchement manuel via l'UI Airflow
-    catchup=False,
-    tags=["tp2", "inf8200", "météo"],
-) as dag:
+    description="Open-Meteo daily weather for several cities -> validated -> DuckDB",
+    schedule="@daily",
+    start_date=datetime(2026, 10, 1),
+    catchup=True,
+    max_active_runs=1,  # DuckDB allows a single writer process at a time
+    default_args={
+        "owner": "data-eng",
+        "retries": 3,
+        "retry_delay": timedelta(minutes=1),
+        "retry_exponential_backoff": True,
+    },
+    tags=["weather", "duckdb", "open-meteo"],
+)
+def weather_pipeline():
+    @task
+    def list_cities() -> list[dict]:
+        from weather.config import CITIES
 
-    t_fetch_montreal = PythonOperator(
-        task_id="fetch_montreal",
-        python_callable=fetch_montreal,
-    )
+        return CITIES
 
-    t_fetch_paris = PythonOperator(
-        task_id="fetch_paris",
-        python_callable=fetch_paris,
-    )
+    @task
+    def fetch(city: dict, ds: str | None = None) -> str:
+        from weather.extract import fetch_city_day
 
-    t_merge = PythonOperator(
-        task_id="merge_cities",
-        python_callable=merge_cities,
-    )
+        return fetch_city_day(city, date.fromisoformat(ds))
 
-    t_transform = PythonOperator(
-        task_id="transform",
-        python_callable=transform,
-    )
+    @task
+    def transform_validate(raw_paths: list[str], ds: str | None = None) -> str:
+        import os
 
-    t_save = PythonOperator(
-        task_id="save_results",
-        python_callable=save_results,
-    )
+        from weather.config import CITIES, DATA_DIR
+        from weather.transform import to_frame, validate
 
-    # Graphe de dépendances :
-    #   fetch_montreal ──┐
-    #                    ├──► merge_cities ──► transform ──► save_results
-    #   fetch_paris ─────┘
-    [t_fetch_montreal, t_fetch_paris] >> t_merge >> t_transform >> t_save
+        df = validate(to_frame(list(raw_paths)), {c["name"] for c in CITIES})
+        out = os.path.join(DATA_DIR, "clean", f"date={ds}", "daily_weather.parquet")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        df.to_parquet(out, index=False)
+        return out
+
+    @task
+    def load(clean_path: str) -> int:
+        import pandas as pd
+        from weather.config import DB_PATH
+        from weather.storage import upsert
+
+        return upsert(pd.read_parquet(clean_path), DB_PATH)
+
+    @task
+    def report(rows_loaded: int, ds: str | None = None) -> str:
+        import os
+
+        from weather.config import DATA_DIR, DB_PATH
+        from weather.storage import rolling_report
+
+        stats = rolling_report(DB_PATH, date.fromisoformat(ds))
+        out = os.path.join(DATA_DIR, "reports", f"weekly_stats_{ds}.csv")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        stats.to_csv(out, index=False)
+        print(f"{rows_loaded} rows loaded for {ds}\n{stats.to_string(index=False)}")
+        return out
+
+    raw = fetch.expand(city=list_cities())
+    report(load(transform_validate(raw)))
+
+
+weather_pipeline()

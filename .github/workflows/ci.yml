@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Airflow (official constraints) + dev deps
+        run: |
+          pip install "apache-airflow==2.9.3" --constraint \
+            "https://raw.githubusercontent.com/apache/airflow/constraints-2.9.3/constraints-3.11.txt"
+          pip install duckdb==1.1.3 pytest==8.3.4 ruff==0.8.4
+      - run: ruff check .
+      - name: Unit tests + DAG integrity
+        run: |
+          airflow db migrate
+          pytest -v
